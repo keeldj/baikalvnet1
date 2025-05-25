@@ -1,101 +1,115 @@
-const { Telegraf } = require('telegraf');
-const bot = new Telegraf(process.env.TELEGRAM_TOKEN || '7861182562:AAF90sgh5_MpZ1bv-uUGL-8cMG6oXb1uwfc');
+import { Telegraf } from 'telegraf';
+import dotenv from 'dotenv';
+import express from 'express';
+import { Client } from 'yookassa';
+import { setupDB } from './src/db/database.js';
+import * as commands from './src/handlers/commands.js';
+import payments from './src/handlers/payments.js';
+import * as settings from './src/handlers/settings.js';
+import * as support from './src/handlers/support.js';
+import { formatTraffic } from './src/utils/formatters.js';
+import config from './src/config.js';
+
+dotenv.config();
+
+// Инициализация
+const app = express();
+const port = process.env.PORT || 3000;
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const db = await setupDB();
+const yooKassa = new Client({
+  shopId: process.env.YOOKASSA_SHOP_ID,
+  secretKey: process.env.YOOKASSA_SECRET_KEY
+});
+// Безопасная проверка всех условий
+if (
+  process.env.YOOKASSA_SHOP_ID && 
+  process.env.YOOKASSA_SECRET_KEY &&
+  process.env.YOOKASSA_SHOP_ID.startsWith('test_') &&
+  process.env.YOOKASSA_SECRET_KEY.startsWith('test_')
+) {
+  console.log('\x1b[33m⚠️ ВНИМАНИЕ! Режим тестовых платежей\x1b[0m');
+  console.log('Используются ключи:');
+  console.log(`SHOP_ID: ${process.env.YOOKASSA_SHOP_ID}`);
+  console.log(`SECRET_KEY: ${process.env.YOOKASSA_SECRET_KEY}`);
+
+// Веб-сервер
+app.use(express.json())
+  .get('/', (_, res) => res.send('VPN Bot Active!'))
+  .post('/yookassa-webhook', async (req, res) => {
+    if (req.body.event === 'payment.succeeded') {
+      const payment = req.body.object;
+      const userId = payment.metadata.user_id;
+
+      // Активация подписки
+      await db.run(
+        'UPDATE users SET is_active = 1, expiry_date = ? WHERE id = ?',
+        [new Date(Date.now() + 30 * 86400000).toISOString(), userId]
+      );
+
+      // Уведомление пользователя
+      await bot.telegram.sendMessage(userId, '✅ Подписка успешно активирована!');
+    }
+    res.status(200).send();
+  })
+  .listen(port);
 
 // Главное меню
-function showMainMenu(ctx) {
-  return ctx.reply(
-    '🔐 <b>Baikal VNet — защищённый VPN с поддержкой Hiddify</b>',
-    {
-      parse_mode: 'HTML',
-      reply_markup: {
-        keyboard: [
-          ['🛍️ Купить подписку', '🔑 Мой конфиг'],
-          ['📲 Установка Hiddify', '📞 Поддержка'],
-          ['📜 Правила использования']
-        ],
-        resize_keyboard: true
+const showMainMenu = (ctx) => ctx.replyWithHTML(config.messages.mainMenu, {
+  reply_markup: { keyboard: config.keyboards.main, resize_keyboard: true }
+});
+
+// Обработчики
+bot.command('start', async (ctx) => commands.handleStart(ctx, db, showMainMenu));
+bot.hears('🔑 Мой профиль', async (ctx) => commands.handleProfile(ctx, db, formatTraffic));
+bot.hears('🌐 Купить подписку', async (ctx) => {
+  try {
+    const payment = await yooKassa.createPayment({
+      amount: {
+        value: '299.00',
+        currency: 'RUB'
+      },
+      payment_method_data: {
+        type: 'bank_card'
+      },
+      confirmation: {
+        type: 'redirect',
+        return_url: `https://t.me/${ctx.botInfo.username}`
+      },
+      description: 'Премиум подписка на 1 месяц',
+      metadata: {
+        user_id: ctx.from.id
       }
-    }
-  );
-}
+    });
 
-// Команда /start
-bot.command('start', showMainMenu);
-
-// Обработка кнопок
-bot.hears('🛍️ Купить подписку', (ctx) => {
-  ctx.reply('Выберите тариф:', {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '1 месяц - 100₽', callback_data: 'tariff_100' }],
-        [{ text: '3 месяца - 190₽ (выгода 30%)', callback_data: 'tariff_190' }],
-        [{ text: '❌ Отмена', callback_data: 'cancel' }]
-      ]
-    }
-  });
-});
-
-bot.hears('🔑 Мой конфиг', async (ctx) => {
-  ctx.replyWithHTML(
-    '⌛ <b>Генерирую ваш конфиг...</b>\n' +
-    'После получения используйте его в Hiddify:',
-    {
+    await ctx.replyWithHTML('💳 Для оплаты подписки нажмите кнопку ниже:', {
       reply_markup: {
-        inline_keyboard: [
-          [{ text: 'Hiddify для Android', url: 'https://play.google.com/store/apps/details?id=app.hiddify.com' }],
-          [{ text: 'Hiddify для iOS', url: 'https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532' }],
-          [{ text: 'Hiddify для Windows', url: 'https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix' }]
-        ]
+        inline_keyboard: [[{
+          text: 'Оплатить 299₽',
+          url: payment.confirmation.confirmation_url
+        }]]
       }
-    }
-  );
-  
-  // Здесь будет реальная генерация конфига через 3x-ui API
-  // const config = await generateVlessConfig(ctx.from.id);
-  // ctx.replyWithHTML(`<code>${config}</code>`);
+    });
+  } catch (e) {
+    console.error('Ошибка платежа:', e);
+    ctx.reply('❌ Не удалось создать платеж. Попробуйте позже.');
+  }
 });
+bot.hears('⚙️ Настройки', (ctx) => settings.showSettingsMenu(ctx, db));
+bot.hears('📞 Поддержка', (ctx) => support.showSupportMenu(ctx));
 
-bot.hears('📲 Установка Hiddify', (ctx) => {
-  ctx.replyWithHTML(
-    '<b>📥 Установка Hiddify:</b>\n\n' +
-    '• <a href="https://play.google.com/store/apps/details?id=app.hiddify.com">Android</a>\n' +
-    '• <a href="https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532">iPhone/iPad</a>\n' +
-    '• <a href="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix">Windows</a>\n\n' +
-    'После установки нажмите "🔑 Мой конфиг"',
-    { disable_web_page_preview: true }
-  );
-});
+// Inline-обработчики
+bot.action(/tariff_(\d+)/, async (ctx) => payments.handleTariffSelect(ctx, db, config));
+bot.action('change_devices', async (ctx) => settings.handleDeviceChange(ctx, db));
+bot.action('toggle_notify', async (ctx) => settings.toggleNotifications(ctx, db));
+bot.action('create_ticket', async (ctx) => support.createSupportTicket(ctx, db));
 
-bot.hears('📞 Поддержка', (ctx) => {
-  ctx.reply('По всем вопросам пишите: @baikalvnet_support');
-});
+  // ... предыдущий код
 
-bot.hears('📜 Правила использования', (ctx) => {
-  ctx.replyWithHTML(
-    '<b>📜 Условия:</b>\n\n' +
-    '• Срок действия: 1/3 месяца\n' +
-    '• Возврат: в течение 3 дней\n' +
-    '• Запрещено нарушать законы РФ\n\n' +
-    '<i>Подключение через Hiddify гарантирует стабильную работу</i>'
-  );
-});
+  // Система
+  setInterval(() => fetch(process.env.REPLIT_URL).catch(console.error), 300000);
+  bot.launch().then(() => console.log('Bot started! 🚀'));
 
-// Обработка выбора тарифа
-bot.action('tariff_100', (ctx) => handleTariff(ctx, 100));
-bot.action('tariff_190', (ctx) => handleTariff(ctx, 190));
-
-async function handleTariff(ctx, amount) {
-  await ctx.deleteMessage(); // Удаляем сообщение с кнопками
-  ctx.replyWithHTML(
-    `💳 <b>Оплата ${amount}₽</b>\n` +
-    'Ссылка для оплаты через ЮKassa: <i>генерируется...</i>\n\n' +
-    'После оплаты автоматически получите конфиг',
-    { reply_markup: { remove_keyboard: true } }
-  );
-  
-  // Здесь будет интеграция с ЮKassa
-}
-
-// Запуск бота
-bot.launch();
-console.log('Бот запущен! 🚀');
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  } // <-- Добавьте эту скобку, если она отсутствует
