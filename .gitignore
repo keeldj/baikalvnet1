@@ -1,5 +1,1 @@
-*.db
-node_modules/
-.env
-.replit
-package-lock.json
+
